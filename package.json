@@ -9,7 +9,8 @@
     "preview": "rspress preview"
   },
   "dependencies": {
-    "@rspress/core": "^2.0.10"
+    "@rspress/core": "^2.0.10",
+    "rspress-plugin-katex": "^1.0.1"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.3.0",
