@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "rspress build",
+    "build:file": "rspress build && bun scripts/make-file-build.mjs",
     "dev": "rspress dev",
     "preview": "rspress preview"
   },
