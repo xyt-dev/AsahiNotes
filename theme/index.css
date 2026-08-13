@@ -1,12 +1,94 @@
-@import 'tailwindcss';
-
-:root {
-  /* Example brand color overrides for the custom theme scaffold. */
-  --rp-c-brand: #0f766e;
-  --rp-c-brand-dark: #115e59;
-  --rp-c-brand-tint: rgba(15, 118, 110, 0.16);
+:where(:root) {
+	--rp-c-brand: #689d6a;
+	--rp-c-brand-light: #8ec07c;
+	--rp-c-brand-lighter: #b8bb26;
+	--rp-c-brand-dark: #427b58;
+	--rp-c-brand-darker: #3c6e47;
+	--rp-c-brand-tint: rgba(104, 157, 106, 0.16);
+	--rp-home-hero-secondary-color: #d79921;
+	--rp-home-hero-title-bg: linear-gradient(
+		90deg,
+		var(--rp-c-brand-dark) 0%,
+		var(--rp-c-brand-dark) 30%,
+		var(--rp-home-hero-secondary-color) 100%
+	);
 }
 
-[data-context="sidebar-hidden"][data-context="sidebar-hidden"] {
-  display: none;
+:where(html:not(.rp-dark)) {
+	--rp-c-bg: #fbf1c7;
+	--rp-c-bg-soft: #f2e5bc;
+	--rp-c-bg-mute: #ebdbb2;
+	--rp-c-bg-alt: #f9f5d7;
+	--rp-c-divider: rgba(60, 56, 54, 0.35);
+	--rp-c-divider-light: rgba(60, 56, 54, 0.18);
+	--rp-c-text-0: #282828;
+	--rp-c-text-1: #3c3836;
+	--rp-c-text-2: #504945;
+	--rp-c-text-3: #7c6f64;
+	--rp-c-text-4: #928374;
+	--rp-c-text-code: #9d0006;
+	--rp-c-text-code-bg: rgba(146, 131, 116, 0.12);
+	--rp-c-text-code-border: rgba(60, 56, 54, 0.08);
+	--rp-code-title-bg: #f2e5bc;
+	--rp-code-block-color: #3c3836;
+	--rp-code-block-bg: #f9f5d7;
+	--rp-code-block-border: 1px solid #d5c4a1;
+	--shiki-foreground: inherit;
+	--shiki-background: transparent;
+	--shiki-token-constant: #8f3f71;
+	--shiki-token-string: #79740e;
+	--shiki-token-comment: #928374;
+	--shiki-token-keyword: #9d0006;
+	--shiki-token-parameter: #b57614;
+	--shiki-token-function: #076678;
+	--shiki-token-string-expression: #79740e;
+	--shiki-token-punctuation: #504945;
+	--shiki-token-link: #427b58;
+	--shiki-token-deleted: #9d0006;
+	--shiki-token-inserted: #79740e;
+	--rp-home-background-bg: #fbf1c7;
+	--rp-home-feature-bg: linear-gradient(135deg, #f9f5d7, #f2e5bc);
+}
+
+:where(html.rp-dark) {
+	--rp-c-brand: #8ec07c;
+	--rp-c-brand-light: #b8bb26;
+	--rp-c-brand-lighter: #d5c4a1;
+	--rp-c-brand-dark: #689d6a;
+	--rp-c-brand-darker: #427b58;
+	--rp-c-brand-tint: rgba(142, 192, 124, 0.16);
+	--rp-home-hero-secondary-color: #fabd2f;
+	--rp-c-bg: #282828;
+	--rp-c-bg-soft: #32302f;
+	--rp-c-bg-mute: #3c3836;
+	--rp-c-bg-alt: #1d2021;
+	--rp-c-divider: rgba(168, 153, 132, 0.55);
+	--rp-c-divider-light: rgba(168, 153, 132, 0.3);
+	--rp-c-text-0: #fbf1c7;
+	--rp-c-text-1: #ebdbb2;
+	--rp-c-text-2: #d5c4a1;
+	--rp-c-text-3: #a89984;
+	--rp-c-text-4: #7c6f64;
+	--rp-c-text-code: #fe8019;
+	--rp-c-text-code-bg: rgba(168, 153, 132, 0.12);
+	--rp-c-text-code-border: rgba(235, 219, 178, 0.06);
+	--rp-code-title-bg: #1d2021;
+	--rp-code-block-color: #ebdbb2;
+	--rp-code-block-bg: #1d2021;
+	--rp-code-block-border: 1px solid #504945;
+	--shiki-foreground: inherit;
+	--shiki-background: transparent;
+	--shiki-token-constant: #d3869b;
+	--shiki-token-string: #b8bb26;
+	--shiki-token-comment: #928374;
+	--shiki-token-keyword: #fb4934;
+	--shiki-token-parameter: #fabd2f;
+	--shiki-token-function: #83a598;
+	--shiki-token-string-expression: #b8bb26;
+	--shiki-token-punctuation: #d5c4a1;
+	--shiki-token-link: #8ec07c;
+	--shiki-token-deleted: #fb4934;
+	--shiki-token-inserted: #b8bb26;
+	--rp-home-background-bg: #282828;
+	--rp-home-feature-bg: linear-gradient(135deg, #32302f, #3c3836);
 }
