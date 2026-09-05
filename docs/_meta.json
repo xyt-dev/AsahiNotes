@@ -8,5 +8,15 @@
     "type": "file",
     "label": "Manual for Rust method resolution",
     "name": "Rust方法查找实验手册"
+  },
+  {
+    "type": "file",
+    "label": "Partial Eq And Derive", 
+    "name": "partial_eq_and_derive"
+  },
+  {
+    "type": "file",
+    "label": "Pointer Provenance In Rust", 
+    "name": "pointer_provenance_in_rust"
   }
 ]
