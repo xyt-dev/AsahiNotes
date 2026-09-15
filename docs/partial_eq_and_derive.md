@@ -1,29 +1,26 @@
-# `PartialEq` and `#[derive(PartialEq)]`
+# `PartialEq` and `#[derive(PartialEq)]`: From Field Comparisons to Bytewise Equality
 
-`PartialEq` looks simple at the surface: it powers `==` and `!=`. Underneath, however, several different mechanisms cooperate:
+`PartialEq` powers Rust's `==` and `!=` operators. A comparison can involve several mechanisms: a derived implementation compares a type's immediate fields, those fields use their own implementations, and selected standard-library implementations use specialization to compare whole memory regions.
 
-- `#[derive(PartialEq)]` generates only the outer comparison logic for your type;
-- standard-library implementations define how built-in containers, slices, arrays, and references compare;
-- trait resolution resolves each nested comparison to the corresponding PartialEq impl, one layer at a time;
-- specialization lets selected standard-library comparisons use a bytewise fast path.
+This article traces how equality comparisons proceed from a derived struct through the standard library to the bytewise fast paths used by slices and arrays.
 
-This article follows that chain from source code down to the `memcmp`-style optimization.
+## 1. The equality contract
 
-## 1. What `PartialEq` is
-
-`PartialEq` is the trait behind the `==` and `!=` operators. Roughly,
+For an overloaded comparison, the expression:
 
 ```rust
 a == b
 ```
 
-desugars to:
+can be understood as:
 
 ```rust
 PartialEq::eq(&a, &b)
 ```
 
-The trait is:
+The operator implicitly borrows its operands. Comparing two owned values does not, by itself, move them. Primitive comparisons have built-in compiler support, which we will return to in Section 3.
+
+The essential interface is:
 
 ```rust
 pub trait PartialEq<Rhs: ?Sized = Self> {
@@ -35,58 +32,32 @@ pub trait PartialEq<Rhs: ?Sized = Self> {
 }
 ```
 
-`Rhs` defaults to `Self`, but it can be different. This is what allows implementations such as comparing one string-like type with another compatible string-like type.
+`Rhs` defaults to `Self`, but a type can also implement comparisons with other types. For example, comparing `String` with `str` uses a different implementation from comparing `String` with `String`.
 
-PartialEq defines a semantic contract, not a compiler-enforced proof. Its implementations are expected to satisfy symmetry and transitivity whenever the corresponding comparisons exist:
+The methods must agree: `a != b` must have the same result as `!(a == b)`. The default `ne` provides this consistency.
 
-$symmetry:      a == b  ⇔  b == a$
+Equality must also be symmetric and transitive whenever the necessary implementations exist:
 
-$transitivity:  a == b ∧ b == c  ⇒  a == c$
+| Property | Requirement | Implementations needed |
+| --- | --- | --- |
+| Symmetry | If `a == b`, then `b == a` | `A: PartialEq<B>` and `B: PartialEq<A>` |
+| Transitivity | If `a == b` and `b == c`, then `a == c` | `A: PartialEq<B>`, `B: PartialEq<C>`, and `A: PartialEq<C>` |
 
-**The compiler does not verify these laws.** A handwritten PartialEq implementation can violate them and still compile. #[derive(PartialEq)] preserves them provided that the PartialEq implementations of all compared fields obey the same contract, because the derived implementation simply composes those field comparisons.
+Rust does not require those reverse or transitive comparison implementations to exist. The laws apply when they do exist. The compiler checks that implementations are well-typed; it does not prove these semantic laws. Violating them is a logic error, and unsafe code must not rely on their correctness for memory safety. See the [`PartialEq` contract](https://doc.rust-lang.org/std/cmp/trait.PartialEq.html).
 
-PartialEq deliberately does not require reflexivity: `a == a` may be false. Floating-point values are the standard example: NaN != NaN, so floating-point types implement PartialEq but not Eq.
+`Eq` adds reflexivity: every value must compare equal to itself. Its essential interface is simply:
 
-`Eq` is a marker trait:
+```rust
+pub trait Eq: PartialEq {}
+```
 
-`pub trait Eq: PartialEq<Self> {}`
+It adds no comparison algorithm. Floating-point types illustrate the distinction: a NaN does not compare equal to itself, so floating-point types implement `PartialEq` but not `Eq`.
 
-It defines no new comparison operation. Instead, implementing Eq adds the semantic promise that the existing PartialEq implementation is also reflexive:
+Deriving `Eq` checks the required field bounds, but it still does not prove that the implementations obey the laws. The actual comparison remains the one supplied by `PartialEq`. See the [`Eq` documentation](https://doc.rust-lang.org/std/cmp/trait.Eq.html).
 
-$\text{reflexivity:}~~a == a~~\text{for every value a.}$
+## 2. What derive generates
 
-**This promise is not proved by the compiler either.** In fact, none of the three equality laws are compiler-verified: PartialEq promises symmetry and transitivity, while Eq additionally promises reflexivity.
-
-Thus:
-
-$$
-\mathrm{PartialEq}
-=
-\left\{
-\begin{aligned}
-&\text{symmetry:} && a = b \iff b = a, \\
-&\text{transitivity:} && (a = b \land b = c) \Rightarrow a = c
-\end{aligned}
-\right.
-$$
-
-$$
-\mathrm{Eq}
-=
-\mathrm{PartialEq}
-\cup
-\left\{
-\text{reflexivity: } a = a
-\right\}
-$$
-
-A relation that is reflexive, symmetric, and transitive is called an equivalence relation. Therefore, implementing `Eq` means promising that the equality relation defined by PartialEq is an equivalence relation.
-
-`#[derive(Eq)]` does not generate another equality algorithm. The actual comparison still comes entirely from `PartialEq`; deriving `Eq` only generates the marker implementation, and the derive is accepted only when the relevant field types satisfy the required `Eq` bounds.
-
-With the semantic distinction between `PartialEq` and `Eq` established, the rest of the discussion focuses on how `PartialEq` implementations are actually produced and composed.
-
-You can implement `PartialEq` manually:
+You can write an implementation directly:
 
 ```rust
 struct Point {
@@ -101,7 +72,7 @@ impl PartialEq for Point {
 }
 ```
 
-or ask the compiler to generate the implementation:
+Or let the built-in derive macro generate the comparison:
 
 ```rust
 #[derive(PartialEq)]
@@ -111,49 +82,71 @@ struct Point {
 }
 ```
 
----
+For this struct, the generated `eq` has the same field-comparison behavior as the handwritten version. The derived implementation uses the trait's default `ne`.
 
-## 2. what `#[derive(PartialEq)]` actually generates
+The central rule is:
 
-`#[derive(PartialEq)]` is a built-in derive macro. it expands the annotated type into an ordinary `impl PartialEq for ...`.
+> **Derive generates the comparison structure for the annotated type. Each immediate field is compared through that field type's own `PartialEq` implementation.**
 
-The generated implementation defines `eq`; `ne` continues to use the default method provided by the trait.
-
-Generated impls are marked with `#[automatically_derived]`. This marker has no semantic effect; it simply lets compiler tools distinguish derive-generated impls from handwritten ones, mainly so diagnostics and lints can avoid blaming code the user did not write.
-
-The most important rule is:  
-**Derive generates only the outer PartialEq implementation for the annotated type. Nested field types are compared through their own `PartialEq` implementations, which derive does not recursively expand.**
-
-For example, if a field has type `Inner`, derive emits an ordinary comparison such as:
+For example:
 
 ```rust
-self.inner == other.inner
+#[derive(PartialEq)]
+struct Inner {
+    value: i32,
+}
+
+#[derive(PartialEq)]
+struct Outer {
+    inner: Inner,
+    enabled: bool,
+}
 ```
 
-and stops there. That comparison uses Inner's own PartialEq implementation.
+The relevant comparison for `Outer` is equivalent to:
 
-The next section shows how this composition works for the main data shapes in Rust.
+```rust
+impl PartialEq for Outer {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner == other.inner && self.enabled == other.enabled
+    }
+}
+```
 
----
+Deriving `Outer` does not paste the body of `Inner::eq` into this method. `Inner` must already have a usable `PartialEq` implementation, whether derived or handwritten.
 
-## 3. comparison by data shape
+For generic types, derive also generates bounds. A basic example is:
 
-The structure of the generated `eq` implementation depends on the shape of the annotated type. The following sections show how equality is implemented for primitive values, structs, enums, and standard container types.
+```rust
+#[derive(PartialEq)]
+struct Wrapper<T> {
+    value: T,
+}
+```
 
-### 3.1 Primitive Types
+Here, the derived implementation requires `T: PartialEq`. For more complex field types, however, derive may impose stricter bounds than necessary. A handwritten implementation could sometimes use less restrictive bounds while performing the comparisons.
 
-Primitive scalar types such as integers, `bool`, and `char` have equality operations built into the language. A direct comparison such as:
+Generated implementations carry `#[automatically_derived]`, which lets tools and diagnostics recognize them. See the [Reference's description of derive](https://doc.rust-lang.org/reference/attributes/derive.html).
+
+This discussion is only about how `==` compares two values. Constants used as patterns have an additional restriction: for structs and enums, `PartialEq` must be derived. A type with a handwritten `PartialEq` implementation is rejected as a constant pattern, even if its eq behaves exactly like the derived implementation, because constant patterns require structural equality rather than an arbitrary user-defined comparison.
+
+See [constant patterns](https://doc.rust-lang.org/reference/patterns.html#constant-patterns).
+
+## 3. Primitive values, enums, and references
+
+### 3.1 Where primitive comparisons end
+
+Consider:
 
 ```rust
 let a: i32 = 1;
 let b: i32 = 2;
-
-a == b
+let equal = a == b;
 ```
 
-is handled as a primitive comparison by the compiler; it does not require a runtime call to `PartialEq::eq`.
+The compiler has a primitive integer comparison operation. It does not need to implement this operation by recursively calling the same trait method.
 
-`core` nevertheless provides `PartialEq` impls for primitive types so the same comparison semantics are available through the trait system. For example, the integer implementation is essentially:
+Nevertheless, `core` supplies `PartialEq` implementations for primitive types so that they also participate in trait-based and generic code. The integer implementation is essentially:
 
 ```rust
 impl PartialEq for i32 {
@@ -163,61 +156,13 @@ impl PartialEq for i32 {
 }
 ```
 
-Here, both operands are already known to be primitive integers, so the `== `expression is lowered to the compiler's primitive integer comparison rather than a runtime call back into the same `PartialEq::eq` implementation.
+Inside this implementation, both operands are known to be integers. The `==` expression reaches the compiler's primitive comparison rather than calling back into the same method.
 
-The impl therefore serves as the trait-level interface to primitive equality.
-It is needed when `i32` is used through `PartialEq`, such as in generic code with `T: PartialEq`; the actual comparison still ends at the compiler's built-in integer equality operation.
+Thus `i32` provides both built-in equality and a trait interface to that equality. Generic code can require `T: PartialEq`, instantiate `T` with `i32`, and ultimately reach the primitive operation. The source-level method boundaries do not imply that the final machine code contains corresponding function calls. See the [primitive implementations in `core::cmp`](https://doc.rust-lang.org/nightly/src/core/cmp.rs.html).
 
-### 3.2 structs
+### 3.2 Enum comparisons
 
-For a struct, derive compares every field and joins the results with `&&`.
-
-Given:
-
-```rust
-#[derive(partialeq)]
-struct point {
-    x: i32,
-    y: i32,
-}
-```
-
-the important part of the expansion is equivalent to:
-
-```rust
-impl partialeq for point {
-    fn eq(&self, other: &point) -> bool {
-        self.x == other.x && self.y == other.y
-    }
-}
-```
-
-For nesting:
-
-```rust
-#[derive(partialeq)]
-struct outer {
-    inner: inner,
-}
-```
-
-derive stops at:
-
-```rust
-self.inner == other.inner
-```
-
-It does **not** paste `inner`'s comparison body into `outer`.
-
-`Inner` only needs to implement `PartialEq` somehow—through derive, a handwritten implementation, or an implementation provided elsewhere.
-
----
-
-### 3.3 enums
-
-For an enum, derive first compares the discriminants of the two values. If the discriminants are equal, it then compares the fields of the corresponding variant.
-
-For example:
+For an enum, equality requires the same variant and equal fields within that variant:
 
 ```rust
 #[derive(PartialEq)]
@@ -227,93 +172,101 @@ enum Shape {
 }
 ```
 
-the important part of the generated implementation is roughly equivalent to:
+A portable handwritten implementation with the same comparison behavior is:
 
 ```rust
 impl PartialEq for Shape {
-    fn eq(&self, other: &Shape) -> bool {
-        let self_discr = ::core::intrinsics::discriminant_value(self);
-        let other_discr = ::core::intrinsics::discriminant_value(other);
-
-        self_discr == other_discr
-            && match (self, other) {
-                (Shape::Circle(a), Shape::Circle(b)) => a == b,
-                _ => true,
-            }
-    }
-}
-```
-
-The discriminant comparison handles the variant itself. If the two values have different variants, it evaluates to false, and the right-hand side of && is not evaluated.
-
-If the discriminants are equal, derive only needs to compare the fields of variants that contain data. For `Shape::Circle`, the generated match arm compares its field:
-
-`a == b`
-
-For a fieldless variant such as `Shape::Point`, there are no fields left to compare, so equality is already established by the discriminant check. This is why the generated match can fall through to `_ => true`.
-
-The structure can therefore be viewed as:
-
-<img
-  src="/EnumPartialEqCompare.png"
-  alt="Enum PartialEq comparison"
-  width="600px"
-/>
-
-As with structs, `derive` only generates the enum's outer comparison structure: discriminant checking and field-by-field comparisons. Any nested comparison is delegated to that field type's own `PartialEq` implementation rather than recursively expanded by `derive`.
-
----
-
-## 4. Slices and arrays
-
-`derive` does not generate the internal equality algorithm for slices or arrays. When a derived field comparison reaches one of these types, it uses the corresponding standard-library `PartialEq` implementation.
-
-The interesting part is that these implementations do not always compare elements one by one. For suitable element types, the standard library can specialize equality into a comparison of the underlying bytes.
-
-### 4.1 Slice equality
-
-The `PartialEq` implementation for slices first checks their lengths:
-
-```rust
-const impl<T, U> PartialEq<[U]> for [T]
-where
-    T: [const] PartialEq<U>,
-{
-    fn eq(&self, other: &[U]) -> bool {
-        let len = self.len();
-
-        if len == other.len() {
-            unsafe {
-                SlicePartialEq::equal_same_length(
-                    self.as_ptr(),
-                    other.as_ptr(),
-                    len,
-                )
-            }
-        } else {
-            false
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Shape::Circle(a), Shape::Circle(b)) => a == b,
+            (Shape::Point, Shape::Point) => true,
+            _ => false,
         }
     }
 }
 ```
 
-The bound `T: [const] PartialEq<U>` expresses the element-level requirement: comparing [T] with [U] is possible only when values of `T` can be compared with values of `U`.
+This implementation is an alternative to the derive above, not an additional implementation to place beside it.
 
-Once the lengths are known to be equal, the public `PartialEq` implementation delegates the actual comparison to the internal S`licePartialEq::equal_same_length` method.
+The same logic can be organized as a discriminant check followed by payload comparisons. In that organization, different discriminants immediately produce `false`. Once equal discriminants have established that both values have the same variant, fieldless variants need no further comparison.
 
-The important point is that `equal_same_length` does not have one fixed implementation.
+That explains why a generated body with a preceding discriminant check can use a final `_ => true` arm. Without that preceding check, the same wildcard would incorrectly accept different variants.
 
----
+```mermaid
+flowchart TD
+    A["Same variant?"] -->|No| B["false"]
+    A -->|Yes| C["Variant has fields?"]
+    C -->|No| D["true"]
+    C -->|Yes| E["Compare corresponding fields"]
+    E --> F["All field comparisons are true"]
+```
 
-### 4.2 `SlicePartialEq` as the specialization point
+The diagram describes equality semantics. It does not require the compiler to emit a particular match expression or a separate physical discriminant load for every enum representation.
 
-The standard library uses an internal trait roughly shaped like:
+### 3.3 Why reference bindings compare the underlying values
+
+In the `Circle` match arm, `a` and `b` are references to the payloads. Their comparison uses the standard library's forwarding implementation for references, conceptually:
 
 ```rust
-#[doc(hidden)]
-const trait SlicePartialEq<B> {
+impl<A: ?Sized, B: ?Sized> PartialEq<&B> for &A
+where
+    A: PartialEq<B>,
+{
+    fn eq(&self, other: &&B) -> bool {
+        PartialEq::eq(*self, *other)
+    }
+}
+```
+
+Here `Self` is `&A`, so the method receives `&&A`. Dereferencing that argument once produces the `&A` required by the underlying comparison.
+
+For the enum example, reference equality therefore reaches `i32` equality. Comparing references in this way compares the referenced values according to their `PartialEq` implementation; it does not test whether the references point to the same allocation. The standard library provides corresponding mutable-reference combinations as well. See the [reference implementations in `core::cmp`](https://doc.rust-lang.org/nightly/src/core/cmp.rs.html).
+
+## 4. Slice equality and specialization
+
+When a field comparison reaches a slice, derive has no slice algorithm to generate. The standard-library implementation handles it.
+
+### 4.1 Check lengths, then delegate
+
+The slice implementation is structured as follows:
+
+```rust
+impl<T, U> PartialEq<[U]> for [T]
+where
+    T: PartialEq<U>,
+{
+    fn eq(&self, other: &[U]) -> bool {
+        let len = self.len();
+
+        if len != other.len() {
+            return false;
+        }
+
+        // SAFETY: Both pointers come from valid slices,
+        // and both slices contain `len` elements.
+        unsafe {
+            SlicePartialEq::equal_same_length(
+                self.as_ptr(),
+                other.as_ptr(),
+                len,
+            )
+        }
+    }
+}
+```
+
+`T: PartialEq<U>` permits the comparison even when the element types differ. Once the lengths match, the implementation delegates to an internal helper trait.
+
+The actual source also includes const-trait syntax such as `const impl` and `T: [const] PartialEq<U>`. The latter expresses a conditional const requirement: ordinary use requires the ordinary trait implementation, while const use requires the corresponding const capability. The sketches here omit that machinery to focus on comparison strategy.
+
+### 4.2 The generic fallback
+
+`SlicePartialEq` provides the internal specialization point:
+
+```rust
+trait SlicePartialEq<B> {
     /// # Safety
-    /// `lhs` and `rhs` are both readable for `len` elements.
+    /// Both pointers must be readable for `len` elements.
     unsafe fn equal_same_length(
         lhs: *const Self,
         rhs: *const B,
@@ -322,14 +275,13 @@ const trait SlicePartialEq<B> {
 }
 ```
 
-Its generic implementation performs an ordinary element-by-element comparison:
+Its generic implementation compares elements in sequence:
 
 ```rust
-const impl<A, B> SlicePartialEq<B> for A
+impl<A, B> SlicePartialEq<B> for A
 where
-    A: [const] PartialEq<B>,
+    A: PartialEq<B>,
 {
-    #[rustc_no_mir_inline]
     default unsafe fn equal_same_length(
         lhs: *const Self,
         rhs: *const B,
@@ -338,10 +290,11 @@ where
         let mut idx = 0;
 
         while idx < len {
+            // SAFETY: `idx < len`, and the caller guarantees
+            // that both ranges are readable.
             if unsafe { *lhs.add(idx) != *rhs.add(idx) } {
                 return false;
             }
-
             idx += 1;
         }
 
@@ -350,158 +303,110 @@ where
 }
 ```
 
-This implementation works for every pair of element types satisfying `A: PartialEq<B>`.
+The loop stops at the first unequal pair. Notice that it calls `!=`, which is why the `eq`/`ne` consistency requirement matters.
 
-The `default` keyword is important: this implementation deliberately acts as the fallback for a more specific overlapping implementation.
+The `default` method can be overridden by a more specific overlapping implementation. This uses specialization, an internal implementation mechanism that that is only available on nightly version.
 
-That specialization point is the reason `SlicePartialEq` exists between the public slice `PartialEq` implementation and the actual comparison loop.
+The helper separates the shared length check from the choice of element-comparison strategy. It is how the standard library organizes this optimization; it should not be read as a general rule that all specialization requires a separate helper trait. See the [slice comparison source](https://doc.rust-lang.org/nightly/src/core/slice/cmp.rs.html).
 
----
+### 4.3 The `BytewiseEq` contract
 
-### 4.3 `BytewiseEq` and the bytewise fast path
-
-Some types can implement equality by comparing their object representation directly.
-
-The standard library represents this property with the internal unsafe marker trait `BytewiseEq`.
-
-Its safety contract is stronger than ordinary `PartialEq`. Roughly, the two types must:
-
-* have the same layout,
-* contain no padding,
-* contain no provenance,
-* and produce the same `eq` and `ne` results as a raw representation comparison.
-
-The important point is that `BytewiseEq` is not merely a mathematical statement that two equality results happen to coincide. It is an unsafe optimization contract: implementing it permits the standard library and compiler to replace typed equality with raw byte or integer comparisons.
-
-The restrictions above therefore ensure both that the result remains correct and that the representation-level comparison itself is valid.
-
-Padding violates the first requirement. Padding bytes are not part of a value's semantic contents, so two values can be equal field by field while containing different bytes in their padding.
-
-Floating-point values provide another example:
-
-```text
--0.0 == +0.0
-```
-
-is `true`, even though `-0.0` and `+0.0` have different bit representations. Raw representation equality therefore does not preserve `PartialEq`.
-
-Provenance is a slightly different restriction.
-
-In Rust's memory model, a pointer carries provenance in addition to its numeric address. Provenance is semantic information associated with the pointer, but it does not necessarily occupy additional bits in the native pointer representation.
-
-Consequently, two pointers with the same address may have identical machine representations and also compare equal even if their provenance differs.
-
-So provenance is not excluded because it necessarily makes byte equality disagree with `PartialEq`.
-
-Instead, the problem is that a provenance-carrying value cannot in general be treated as nothing more than ordinary integer bits. `BytewiseEq` permits exactly such a representation-level implementation of equality, so its safety contract requires provenance-free values.
-
-In other words:
-
-```text
-padding / floating point
-    -> raw representation equality may produce the wrong result
-
-provenance
-    -> raw integer/byte comparison is not in general a valid
-       replacement operation for a provenance-carrying value
-```
-
-For element types satisfying `BytewiseEq`, `SlicePartialEq` provides a more specific implementation:
+Some element types permit equality to be decided from their underlying bytes. The standard library marks selected implementations with the internal unsafe trait `BytewiseEq`:
 
 ```rust
-const impl<A, B> SlicePartialEq<B> for A
+// Simplified: this trait is internal to core.
+unsafe trait BytewiseEq<Rhs = Self>: PartialEq<Rhs> + Sized {}
+```
+
+Its contract requires compatible layouts, no padding, no provenance in the values, and `eq`/`ne` behavior matching representation comparison. Implementing the trait is an unsafe assertion by the implementer, not a compiler-generated proof. The contract and concrete implementations are in the [`BytewiseEq` source](https://doc.rust-lang.org/src/core/cmp/bytewise.rs.html).
+
+These conditions address both semantic correctness and the validity of reading the representation.
+
+**Padding.** Equal field values do not imply equal padding bytes. Moreover, initialized fields do not imply initialized padding. A raw comparison can therefore violate the operation's safety requirements, rather than merely return an unexpected result. The `raw_eq` intrinsic explicitly rules out uninitialized bytes, including padding.
+
+**Floating-point values.** `-0.0 == +0.0` is true despite their different representations. A NaN also compares unequal to itself even when its bytes are unchanged. Byte equality cannot reproduce those semantics.
+
+**Provenance.** Pointer provenance carries information beyond the numeric address in Rust's memory model; it need not occupy extra native pointer bits. A representation-level operation must still be valid for the values it examines. In particular, `raw_eq` explicitly forbids provenance-bearing bytes during compile-time evaluation. This is a concrete reason to retain the provenance-free requirement, without claiming that every runtime inspection of pointer representation is forbidden. See the [`raw_eq` safety requirements](https://doc.rust-lang.org/nightly/std/intrinsics/fn.raw_eq.html).
+
+The provenance restriction concerns the values being compared. It does not mean that the `lhs` and `rhs` pointers used to access an ordinary integer slice must lack provenance.
+
+### 4.4 Comparing the whole byte range
+
+For marked element types, a more specific implementation replaces the element loop:
+
+```rust
+impl<A, B> SlicePartialEq<B> for A
 where
-    A: [const] BytewiseEq<B>,
+    A: BytewiseEq<B>,
 {
-    #[inline]
     unsafe fn equal_same_length(
         lhs: *const Self,
         rhs: *const B,
         len: usize,
     ) -> bool {
+        // SAFETY: The readable element ranges imply a representable
+        // byte size. BytewiseEq permits comparing those bytes.
         unsafe {
-            let size = crate::intrinsics::unchecked_mul(len, Self::SIZE);
-            compare_bytes(lhs as _, rhs as _, size) == 0
+            let bytes = core::intrinsics::unchecked_mul(
+                len,
+                core::mem::size_of::<Self>(),
+            );
+            core::intrinsics::compare_bytes(
+                lhs.cast::<u8>(),
+                rhs.cast::<u8>(),
+                bytes,
+            ) == 0
         }
     }
 }
 ```
 
-Instead of invoking `PartialEq` once for every element, this implementation compares the entire memory range using `compare_bytes`.
+This sketch spells out the element size with `size_of`; the linked source uses its internal size helper. The intrinsic compares the whole byte range and returns zero when the ranges match. The backend can lower it to a `memcmp`-style operation; the exact generated code is not guaranteed. See [`compare_bytes`](https://doc.rust-lang.org/nightly/std/intrinsics/fn.compare_bytes.html).
 
-`compare_bytes` is a compiler intrinsic:
+There are two different kinds of decision here:
+
+| Decision | How it is made |
+| --- | --- |
+| Are these two slices equally long? | A value-dependent check, unless optimization can eliminate it |
+| Which `SlicePartialEq` implementation applies? | Static implementation selection for the concrete element types |
+
+The program does not inspect a slice's contents at runtime to discover whether its element type implements `BytewiseEq`.
+
+Nor does derive automatically supply that marker for a suitable-looking user type:
 
 ```rust
-#[rustc_intrinsic]
-pub const unsafe fn compare_bytes(
-    left: *const u8,
-    right: *const u8,
-    bytes: usize,
-) -> i32;
+#[derive(PartialEq)]
+#[repr(transparent)]
+struct Id(u32);
 ```
 
-The compiler can lower this representation-level comparison efficiently, typically to a `memcmp`-style operation for sufficiently large ranges.
+Although this wrapper has a simple representation and comparison, it has no standard-library `BytewiseEq` implementation. Slice equality for `Id` therefore selects the generic fallback in the implementation described here. The compiler may subsequently optimize that fallback; such optimization is separate from selecting the marker-based specialization.
 
-The resulting dispatch is:
+## 5. Arrays and standard containers
 
-```text
-[T] == [U]
-    |
-    +-- lengths differ
-    |       |
-    |       `-- false
-    |
-    `-- lengths equal
-            |
-            +-- T: BytewiseEq<U>
-            |       |
-            |       `-- compare the whole byte range
-            |
-            `-- otherwise
-                    |
-                    `-- compare elements one by one
-```
+### 5.1 Arrays have a separate specialization path
 
-This is the purpose of the hidden `SlicePartialEq` layer: it creates a specialization point between the public `PartialEq` implementation and the actual comparison strategy.
+For equal-length array types `[T; N]` and `[U; N]`, the standard library uses an internal `SpecArrayEq` helper. Its generic implementation delegates to slice equality. Its `BytewiseEq` specialization uses `raw_eq` to compare the entire array.
 
-The generic implementation provides the element-by-element fallback, while the more specific `BytewiseEq` implementation replaces it whenever raw representation comparison is both semantically correct and valid for the element type.
+Arrays add no padding between their elements, so the element contract supports this whole-array operation. The array size is known statically, which also gives the backend opportunities to use fixed-width comparisons. Larger comparisons can still become `memcmp` calls. See the [array equality implementation](https://doc.rust-lang.org/nightly/src/core/array/equality.rs.html) and [`raw_eq`](https://doc.rust-lang.org/nightly/std/intrinsics/fn.raw_eq.html).
 
----
+### 5.2 `Vec<T>` delegates to slices
 
-### 4.4 Arrays
-
-Arrays use a separate internal specialization path, `SpecArrayEq`. When the element types implement `BytewiseEq`, the entire array can be compared directly with `raw_eq`; otherwise the implementation falls back to slice equality.
-
-This follows the same principle as the slice optimization above, so the array-specific machinery is not discussed further here.
-
-## 5. Standard containers
-
-### 5.1 `Vec<T>`
-
-`Vec<T>` forwards equality to slices:
+A simplified same-type implementation is:
 
 ```rust
 impl<T: PartialEq> PartialEq for Vec<T> {
-    fn eq(&self, other: &Vec<T>) -> bool {
+    fn eq(&self, other: &Self) -> bool {
         self[..] == other[..]
     }
 }
 ```
 
-So:
+The real implementation also supports compatible different element types and allocator types. Equality concerns the initialized elements, not the vector's capacity or allocation address. See the [`Vec` equality source](https://doc.rust-lang.org/nightly/src/alloc/vec/partial_eq.rs.html).
 
-```text
-Vec<T>
-   -> [T]
-      -> SlicePartialEq
-         -> element loop or bytewise fast path
-```
+### 5.3 `String` derives equality over its vector
 
----
-
-### 5.2 `String`
-
-`String` derives `PartialEq` over its single internal field:
+The standard-library definition includes:
 
 ```rust
 #[derive(PartialEq, PartialOrd, Eq, Ord)]
@@ -510,170 +415,58 @@ pub struct String {
 }
 ```
 
-Conceptually, its derived equality is:
+Consequently, `String == String` compares its `vec` field, reaches slice equality for `u8`, and can use the bytewise specialization. Separate implementations handle comparisons with `str` and `&str`. See the [`String` source](https://doc.rust-lang.org/nightly/src/alloc/string.rs.html).
 
-```rust
-impl PartialEq for String {
-    fn eq(&self, other: &String) -> bool {
-        self.vec == other.vec
-    }
-}
-```
+### 5.4 Other forwarding behavior
 
-Therefore:
-
-```text
-String
-    -> Vec<u8>
-    -> [u8]
-    -> bytewise comparison
-```
-
-`String` also provides separate `PartialEq` implementations for comparisons with `str` and `&str`, but those are additional cross-type comparisons rather than the implementation used for `String == String`.
-
----
-
-### 5.3 `Option<T>`
-
-`Option<T>` compares variants first:
-
-```text
-None     == None     -> true
-Some(a)  == Some(b)  -> a == b
-None     == Some(_)  -> false
-Some(_)  == None     -> false
-```
-
-The payload comparison again delegates to `T`'s own `PartialEq`.
-
----
-
-### 5.4 `Box<T>`
-
-`Box<T>` comparison forwards to the contained value.
-
-The box itself is not semantically compared by pointer address; equality is determined by the pointee's `PartialEq`.
-
----
-
-## 6. References
-
-The standard library provides forwarding implementations for references.
-
-Conceptually:
-
-```rust
-const impl<A: PointeeSized, B: PointeeSized> PartialEq<&B> for &A
-where
-    A: [const] PartialEq<B>,
-{
-    fn eq(&self, other: &&B) -> bool {
-        PartialEq::eq(*self, *other)
-    }
-}
-```
-
-So:
-
-```text
-&A == &B
-```
-
-forwards to:
-
-```text
-A == B
-```
-
-with corresponding mutable-reference variants as well.
-
-This is why generated comparisons involving fields bound by reference can look as though they introduce another `&` layer without changing the semantic comparison target: the reference implementation simply forwards to the underlying types.
-
----
-
-## 7. How nesting actually composes
-
-Consider:
-
-```rust
-Vec<Vec<i32>>
-```
-
-The comparison chain is conceptually:
-
-```text
-Vec<Vec<i32>> == Vec<Vec<i32>>
-    |
-    v
-[Vec<i32>] == [Vec<i32>]
-    |
-    v
-compare each Vec<i32>
-    |
-    v
-[i32] == [i32]
-    |
-    v
-bytewise-compatible integer comparison
-```
-
-Nothing in `#[derive(PartialEq)]` recursively expands this entire chain.
-
-Every layer contributes exactly one ordinary `PartialEq` implementation, and trait resolution composes them.
-
-That is the central model to keep in mind.
-
----
-
-## 8. The whole mechanism in one table
-
-| Layer | Responsibility |
+| Type or comparison | Equality behavior |
 | --- | --- |
-| `#[derive(PartialEq)]` | Generate the current type's field/variant comparison shell |
-| stdlib `PartialEq` impls | Define equality for slices, arrays, references, and containers |
-| hidden helper traits | Introduce internal dispatch points such as `SlicePartialEq` |
-| specialization | Select a more specific implementation when allowed |
-| `BytewiseEq` | Prove that semantic equality is equivalent to byte equality |
-| backend intrinsic | Lower the byte comparison to efficient machine code |
-| trait resolution | Connect all of the above recursively |
+| `None == None` | `true` |
+| `Some(a) == Some(b)` | Compare `a` and `b` |
+| `None == Some(_)`, or the reverse | `false` |
+| `Box<T>` | Compare the contained values through `T`'s `PartialEq` |
+| `&T` | Forward to the referenced value's comparison |
 
-The most important invariant is:
+These types contribute their own comparison semantics. A surrounding derive simply uses those semantics for the corresponding field.
 
-> **nesting is handled by trait resolution, not by recursive derive expansion.**
+## 6. How nested comparisons compose
 
-A derived type only emits comparisons of its immediate fields. Each field type is then responsible for its own equality semantics.
+Consider a complete type:
 
----
-
-## 9. A compact mental model
-
-For ordinary derived data:
-
-```text
-derive
-  -> compare immediate fields
-     -> each field's PartialEq
-        -> repeat until a concrete implementation is reached
+```rust
+#[derive(PartialEq)]
+struct Record {
+    name: String,
+    rows: Vec<Vec<i32>>,
+}
 ```
 
-For slices:
+Its outer comparison is equivalent to:
 
-```text
-slice PartialEq
-  -> length check
-  -> SlicePartialEq
-       -> generic element loop
-       -> or BytewiseEq specialization
-            -> compare_bytes
+```rust
+impl PartialEq for Record {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.rows == other.rows
+    }
+}
 ```
 
-For nested containers:
+For `name`, `String` comparison reaches its `Vec<u8>`, then slice equality, then the bytewise fast path.
 
-```text
-outer container
-  -> asks whether its element type has a fast path
-  -> otherwise compares elements
-       -> each element may itself have another fast path
+For `rows`, the outer vector delegates to a slice of `Vec<i32>`. Those elements must be compared through their vector implementations. Comparing the outer vector descriptors as bytes would not compare the separately allocated row contents.
+
+Each row comparison then reaches a slice of `i32`, whose elements have the bytewise marker. Thus the outer slice uses element comparisons while an inner comparison can use a bytewise fast path.
+
+```mermaid
+flowchart TD
+    A["Record equality"] --> B["Compare name"]
+    B --> C["String delegates through Vec to byte slice"]
+    C --> D["Names equal?"]
+    D -->|No| E["false"]
+    D -->|Yes| F["Compare rows"]
+    F --> G["Outer slice compares each Vec"]
+    G --> H["Each row compares an i32 slice"]
+    H --> I["Inner bytewise fast path"]
 ```
 
-That is the full story: `derive` builds only the outer shell; the standard library supplies the reusable comparison machinery; specialization chooses selected internal fast paths; and the type system composes everything one layer at a time.
+The diagram shows how implementations compose, not a promise about the final call stack. Generic code is instantiated for concrete types, and subsequent optimization can inline methods or eliminate intermediate operations. See [monomorphization in the compiler guide](https://rustc-dev-guide.rust-lang.org/backend/monomorph.html).ation selection and the compiler complete the path to executable code.
