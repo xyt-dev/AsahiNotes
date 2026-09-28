@@ -13,5 +13,10 @@
     "type": "file",
     "label": "Partial Eq And Derive", 
     "name": "partial_eq_and_derive"
+  },
+  {
+    "type": "file",
+    "label": "Specialization",
+    "name": "Rust特化最小例子"
   }
 ]

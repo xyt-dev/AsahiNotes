@@ -363,9 +363,7 @@ where
 }
 ```
 
-`compare_bytes` compares the entire byte range and returns zero when the ranges match; the backend may lower it to a `memcmp`-style operation, although the exact generated code is not guaranteed. 
-
-Slice length is value-dependent, while `SlicePartialEq` selection is determined statically by the element types.
+`compare_bytes` compares the entire byte range and returns zero when the ranges match; the backend may lower it to a `memcmp`-style operation, although the exact generated code is not guaranteed. Slice length is value-dependent, while `SlicePartialEq` selection is determined statically by the element types.
 
 Deriving `PartialEq` does not automatically provide `BytewiseEq`:
 
@@ -381,9 +379,53 @@ Despite its simple representation and comparison semantics, `Id` has no standard
 
 ### 5.1 Arrays have a separate specialization path
 
-For equal-length array types `[T; N]` and `[U; N]`, the standard library uses an internal `SpecArrayEq` helper. Its generic implementation delegates to slice equality. Its `BytewiseEq` specialization uses `raw_eq` to compare the entire array.
+Array equality does not use the same specialization path as slice equality. For two arrays of the same length, `[T; N]` and `[U; N]`, the standard library goes through an internal `SpecArrayEq` helper.
 
-Arrays add no padding between their elements, so the element contract supports this whole-array operation. The array size is known statically, which also gives the backend opportunities to use fixed-width comparisons. Larger comparisons can still become `memcmp` calls. See the [array equality implementation](https://doc.rust-lang.org/nightly/src/core/array/equality.rs.html) and [`raw_eq`](https://doc.rust-lang.org/nightly/std/intrinsics/fn.raw_eq.html).
+```rust
+const trait SpecArrayEq<Other, const N: usize>: Sized {
+    fn spec_eq(a: &[Self; N], b: &[Other; N]) -> bool;
+    fn spec_ne(a: &[Self; N], b: &[Other; N]) -> bool;
+}
+
+const impl<T: [const] PartialEq<Other>, Other, const N: usize>
+    SpecArrayEq<Other, N> for T
+{
+    default fn spec_eq(a: &[Self; N], b: &[Other; N]) -> bool {
+        a[..] == b[..]
+    }
+
+    default fn spec_ne(a: &[Self; N], b: &[Other; N]) -> bool {
+        a[..] != b[..]
+    }
+}
+// specialized
+const impl<T: [const] BytewiseEq<U>, Other, const N: usize>
+    SpecArrayEq<Other, N> for T
+{
+    fn spec_eq(a: &[T; N], b: &[Other; N]) -> bool {
+        unsafe {
+            crate::intrinsics::raw_eq(
+                a,
+                crate::mem::transmute(b),
+            )
+        }
+    }
+
+    fn spec_ne(a: &[T; N], b: &[Other; N]) -> bool {
+        !Self::spec_eq(a, b)
+    }
+}
+```
+
+The generic implementation delegates to slice equality. However, when the **element types** satisfy `T: BytewiseEq<U>`, a specialized implementation compares the entire arrays with `raw_eq`.
+
+The important point is that this specialization depends on the element types, not on `[T; N]` itself implementing `BytewiseEq`. Therefore, an array such as `[u8; 9]` can still take the `raw_eq` fast path even if `[u8; 9]` is not itself marked `BytewiseEq`.
+
+This whole-array comparison is sound because arrays place their elements contiguously with no padding between elements, and `BytewiseEq` guarantees that comparing each element by representation is valid and agrees with `PartialEq`.
+
+Because `N` is known at compile time, the backend also knows the total comparison size statically. It may therefore lower `raw_eq` to a few fixed-width loads and comparisons, while larger arrays may still become a `memcmp`-style call. The exact generated code is not guaranteed.
+
+See the [array equality implementation](https://doc.rust-lang.org/nightly/src/core/array/equality.rs.html) and [`raw_eq`](https://doc.rust-lang.org/nightly/std/intrinsics/fn.raw_eq.html).
 
 ### 5.2 `Vec<T>` delegates to slices
 
