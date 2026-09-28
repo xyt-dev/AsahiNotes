@@ -326,9 +326,11 @@ These conditions address both semantic correctness and the validity of reading t
 
 **Floating-point values.** `-0.0 == +0.0` is true despite their different representations. A NaN also compares unequal to itself even when its bytes are unchanged. Byte equality cannot reproduce those semantics.
 
-**Provenance.** Pointer provenance carries information beyond the numeric address in Rust's memory model; it need not occupy extra native pointer bits. A representation-level operation must still be valid for the values it examines. In particular, `raw_eq` explicitly forbids provenance-bearing bytes during compile-time evaluation. This is a concrete reason to retain the provenance-free requirement, without claiming that every runtime inspection of pointer representation is forbidden. See the [`raw_eq` safety requirements](https://doc.rust-lang.org/nightly/std/intrinsics/fn.raw_eq.html).
+**Provenance.** The consequences of provenance differ between compile-time and run-time byte comparison. During compile-time evaluation, `raw_eq` explicitly forbids provenance-bearing bytes: the evaluator has no native pointer representation whose address bytes it can simply inspect, yet `raw_eq` must still produce a definite `bool`. An `E0080` in such a case reflects this CTFE-specific requirement, not a general prohibition on inspecting pointer representations. At run time, a pointer has a concrete machine representation, so the same raw comparison is permitted and can produce a definite result.
 
-The provenance restriction concerns the values being compared. It does not mean that the `lhs` and `rhs` pointers used to access an ordinary integer slice must lack provenance.
+This also shows that the provenance-free requirement is a conservative sufficient condition rather than a necessary condition for every possible run-time byte comparison. Even at run time, however, byte equality is not an identity test: two pointer values may have the same address representation while differing in provenance. `BytewiseEq` therefore requires more than merely being safely readable as bytes; it guarantees that representation equality agrees with `==`. Pointer types do not satisfy that stronger contract, which is why they do not carry the marker. This should not be confused with a claim that every run-time inspection of pointer representation is forbidden. See the [`raw_eq`](https://doc.rust-lang.org/nightly/std/intrinsics/fn.raw_eq.html)[ safety requirements](https://doc.rust-lang.org/nightly/std/intrinsics/fn.raw_eq.html).
+
+The provenance restriction applies to the **values whose representations are being compared**, not to the pointers used to reach those values. Thus, the `lhs` and `rhs` pointers passed when comparing an ordinary integer slice may themselves carry provenance; what matters is that the slice elements being compared satisfy the `BytewiseEq` requirements.
 
 ### 4.4 Comparing the whole byte range
 
@@ -361,18 +363,11 @@ where
 }
 ```
 
-This sketch spells out the element size with `size_of`; the linked source uses its internal size helper. The intrinsic compares the whole byte range and returns zero when the ranges match. The backend can lower it to a `memcmp`-style operation; the exact generated code is not guaranteed. See [`compare_bytes`](https://doc.rust-lang.org/nightly/std/intrinsics/fn.compare_bytes.html).
+`compare_bytes` compares the entire byte range and returns zero when the ranges match; the backend may lower it to a `memcmp`-style operation, although the exact generated code is not guaranteed. 
 
-There are two different kinds of decision here:
+Slice length is value-dependent, while `SlicePartialEq` selection is determined statically by the element types.
 
-| Decision | How it is made |
-| --- | --- |
-| Are these two slices equally long? | A value-dependent check, unless optimization can eliminate it |
-| Which `SlicePartialEq` implementation applies? | Static implementation selection for the concrete element types |
-
-The program does not inspect a slice's contents at runtime to discover whether its element type implements `BytewiseEq`.
-
-Nor does derive automatically supply that marker for a suitable-looking user type:
+Deriving `PartialEq` does not automatically provide `BytewiseEq`:
 
 ```rust
 #[derive(PartialEq)]
@@ -380,7 +375,7 @@ Nor does derive automatically supply that marker for a suitable-looking user typ
 struct Id(u32);
 ```
 
-Although this wrapper has a simple representation and comparison, it has no standard-library `BytewiseEq` implementation. Slice equality for `Id` therefore selects the generic fallback in the implementation described here. The compiler may subsequently optimize that fallback; such optimization is separate from selecting the marker-based specialization.
+Despite its simple representation and comparison semantics, `Id` has no standard-library `BytewiseEq` implementation, so its slice equality uses the generic fallback. The backend might still optimize that fallback later though.
 
 ## 5. Arrays and standard containers
 
