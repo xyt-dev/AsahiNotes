@@ -377,9 +377,28 @@ Despite its simple representation and comparison semantics, `Id` has no standard
 
 ## 5. Arrays and standard containers
 
+Standard containers either provide their own specialization path or delegate equality to their contents, which may eventually reach slice equality.
+
 ### 5.1 Arrays have a separate specialization path
 
-Array equality does not use the same specialization path as slice equality. For two arrays of the same length, `[T; N]` and `[U; N]`, the standard library goes through an internal `SpecArrayEq` helper.
+Array equality has its own specialization layer. For two arrays `[T; N]` and `[U; N]`, the `PartialEq` implementation delegates to an internal `SpecArrayEq` helper:
+
+```rust
+impl<T, U, const N: usize> PartialEq<[U; N]> for [T; N]
+where
+    T: PartialEq<U>,
+{
+    fn eq(&self, other: &[U; N]) -> bool {
+        SpecArrayEq::spec_eq(self, other)
+    }
+
+    fn ne(&self, other: &[U; N]) -> bool {
+        SpecArrayEq::spec_ne(self, other)
+    }
+}
+```
+
+`SpecArrayEq` then provides two implementations:
 
 ```rust
 const trait SpecArrayEq<Other, const N: usize>: Sized {
@@ -387,6 +406,7 @@ const trait SpecArrayEq<Other, const N: usize>: Sized {
     fn spec_ne(a: &[Self; N], b: &[Other; N]) -> bool;
 }
 
+// Generic fallback.
 const impl<T: [const] PartialEq<Other>, Other, const N: usize>
     SpecArrayEq<Other, N> for T
 {
@@ -398,11 +418,12 @@ const impl<T: [const] PartialEq<Other>, Other, const N: usize>
         a[..] != b[..]
     }
 }
-// specialized
-const impl<T: [const] BytewiseEq<U>, Other, const N: usize>
-    SpecArrayEq<Other, N> for T
+
+// Bytewise specialization.
+const impl<T: [const] BytewiseEq<U>, U, const N: usize>
+    SpecArrayEq<U, N> for T
 {
-    fn spec_eq(a: &[T; N], b: &[Other; N]) -> bool {
+    fn spec_eq(a: &[T; N], b: &[U; N]) -> bool {
         unsafe {
             crate::intrinsics::raw_eq(
                 a,
@@ -411,39 +432,125 @@ const impl<T: [const] BytewiseEq<U>, Other, const N: usize>
         }
     }
 
-    fn spec_ne(a: &[T; N], b: &[Other; N]) -> bool {
+    fn spec_ne(a: &[T; N], b: &[U; N]) -> bool {
         !Self::spec_eq(a, b)
     }
 }
 ```
 
-The generic implementation delegates to slice equality. However, when the **element types** satisfy `T: BytewiseEq<U>`, a specialized implementation compares the entire arrays with `raw_eq`.
+The selection is static specialization, not a runtime test:
 
-The important point is that this specialization depends on the element types, not on `[T; N]` itself implementing `BytewiseEq`. Therefore, an array such as `[u8; 9]` can still take the `raw_eq` fast path even if `[u8; 9]` is not itself marked `BytewiseEq`.
+```text
+[T; N] == [U; N]
+        |
+        v
+SpecArrayEq::spec_eq
+        |
+        +-- T: BytewiseEq<U>
+        |       |
+        |       v
+        |    raw_eq(a, b)
+        |
+        `-- generic PartialEq only
+                |
+                v
+             a[..] == b[..]
+                |
+                v
+           slice equality
+```
 
-This whole-array comparison is sound because arrays place their elements contiguously with no padding between elements, and `BytewiseEq` guarantees that comparing each element by representation is valid and agrees with `PartialEq`.
-
-Because `N` is known at compile time, the backend also knows the total comparison size statically. It may therefore lower `raw_eq` to a few fixed-width loads and comparisons, while larger arrays may still become a `memcmp`-style call. The exact generated code is not guaranteed.
-
-See the [array equality implementation](https://doc.rust-lang.org/nightly/src/core/array/equality.rs.html) and [`raw_eq`](https://doc.rust-lang.org/nightly/std/intrinsics/fn.raw_eq.html).
-
-### 5.2 `Vec<T>` delegates to slices
-
-A simplified same-type implementation is:
+The generic implementation therefore reuses the slice machinery almost completely. Once
 
 ```rust
-impl<T: PartialEq> PartialEq for Vec<T> {
-    fn eq(&self, other: &Self) -> bool {
+a[..] == b[..]
+```
+
+is reached, the arrays have been viewed as `&[T]` and `&[U]`, and the normal slice equality path takes over.
+
+The specialized implementation avoids that path entirely. If the **element types** satisfy
+
+```rust
+T: BytewiseEq<U>
+```
+
+the entire arrays are compared directly with `raw_eq`.
+
+The important distinction is that this specialization depends on the **element types**, not on the array types themselves implementing `BytewiseEq`. For example,
+
+```rust
+[u8; 9] == [u8; 9]
+```
+
+can use the `raw_eq` specialization because
+
+```rust
+u8: BytewiseEq<u8>
+```
+
+even if `[u8; 9]` itself is not marked `BytewiseEq`.
+
+These are separate questions:
+
+```text
+Can [u8; 9] == [u8; 9] use the array fast path?
+    -> requires u8: BytewiseEq<u8>
+    -> yes
+
+Is [u8; 9] itself BytewiseEq?
+    -> separate marker implementation
+    -> not necessarily
+```
+
+The second property matters when the array itself becomes an element of another container, for example `&[[u8; 9]]`.
+
+Comparing the whole array at once is sound because arrays store their elements contiguously without padding between elements, while `BytewiseEq` guarantees that the element representations may safely be compared as bytes and that such comparison agrees with `PartialEq`.
+
+Because `N` is a compile-time constant, the total array size is also statically known. The backend may therefore lower `raw_eq` to fixed-width integer or vector comparisons. Above a backend-dependent threshold, it may instead emit a `memcmp`-style operation. The exact generated code is not guaranteed.
+
+### 5.2 `Vec<T>` forwards equality to slices
+
+`Vec` does not introduce another bytewise specialization layer. The standard library uses the internal `__impl_slice_eq1!` macro to generate its equality implementations. For comparisons between two vectors, the macro expands to the following implementation, with stability attributes omitted:
+
+```rust
+const impl<T, U, A1: Allocator, A2: Allocator>
+    PartialEq<Vec<U, A2>> for Vec<T, A1>
+where
+    T: [const] PartialEq<U>,
+{
+    #[inline]
+    fn eq(&self, other: &Vec<U, A2>) -> bool {
         self[..] == other[..]
+    }
+
+    #[inline]
+    fn ne(&self, other: &Vec<U, A2>) -> bool {
+        self[..] != other[..]
     }
 }
 ```
 
-The real implementation also supports compatible different element types and allocator types. Equality concerns the initialized elements, not the vector's capacity or allocation address. See the [`Vec` equality source](https://doc.rust-lang.org/nightly/src/alloc/vec/partial_eq.rs.html).
+The two vectors may have different element types, `T` and `U`, provided that `T: PartialEq<U>`. They may also use different allocator types, `A1` and `A2`.
 
-### 5.3 `String` derives equality over its vector
+Both methods forward directly to slice comparison. The full-range indexing expressions `self[..]` and `other[..]` expose the elements without copying them. Slice equality then checks the lengths and uses either generic element comparison or the `BytewiseEq` specialization.
 
-The standard-library definition includes:
+The same macro generates implementations for comparisons with slices and arrays. Even when the right-hand operand is an array, `other[..]` converts the comparison to slice equality, rather than using the array-specific `SpecArrayEq` path.
+
+Only the elements in `0..len` participate in equality. Capacity, allocation address, and spare storage are not compared. Consequently, separately allocated vectors with different capacities can compare equal:
+
+```rust
+let mut a = Vec::with_capacity(4);
+a.extend([1, 2, 3]);
+
+let mut b = Vec::with_capacity(16);
+b.extend([1, 2, 3]);
+
+assert_eq!(a, b);
+```
+
+### 5.3 `String` reaches the same bytewise path through `Vec<u8>`
+
+`String` stores its contents in a `Vec<u8>` and derives `PartialEq`:
 
 ```rust
 #[derive(PartialEq, PartialOrd, Eq, Ord)]
@@ -452,23 +559,63 @@ pub struct String {
 }
 ```
 
-Consequently, `String == String` compares its `vec` field, reaches slice equality for `u8`, and can use the bytewise specialization. Separate implementations handle comparisons with `str` and `&str`. See the [`String` source](https://doc.rust-lang.org/nightly/src/alloc/string.rs.html).
+The derived same-type equality therefore compares the `vec` field:
 
-### 5.4 Other forwarding behavior
+```text
+String == String
+       |
+       v
+Vec<u8> == Vec<u8>
+       |
+       v
+[u8] == [u8]
+       |
+       v
+u8: BytewiseEq<u8>
+       |
+       v
+bytewise slice specialization
+```
 
-| Type or comparison | Equality behavior |
+So `String` does not need a special `String`-specific byte comparison for `String == String`. Its representation naturally forwards the comparison through `Vec<u8>` to slice equality, where `u8` can use the bytewise fast path.
+
+Separate `PartialEq` implementations handle comparisons involving `str`, `&str`, and related string types, but the same general principle applies: equality ultimately concerns the string contents, not allocation identity or spare capacity.
+
+### 5.4 Other containers contribute their own equality semantics
+
+Not every type simply exposes a contiguous byte sequence. Other standard types define equality according to their own semantic structure, and an enclosing `#[derive(PartialEq)]` simply invokes those implementations.
+
+| Type or comparison | Equality semantics |
 | --- | --- |
 | `None == None` | `true` |
-| `Some(a) == Some(b)` | Compare `a` and `b` |
-| `None == Some(_)`, or the reverse | `false` |
-| `Box<T>` | Compare the contained values through `T`'s `PartialEq` |
-| `&T` | Forward to the referenced value's comparison |
+| `Some(a) == Some(b)` | compare `a` with `b` |
+| `None == Some(_)` or the reverse | `false` |
+| `Box<T>` | compare the contained `T` values |
+| `&T` | forward comparison to the referenced values |
 
-These types contribute their own comparison semantics. A surrounding derive simply uses those semantics for the corresponding field.
+The general pattern is therefore:
+
+```text
+derived/container equality
+        |
+        v
+equality semantics of each field or element
+        |
+        v
+possibly another forwarding layer
+        |
+        v
+slice/array specialization where applicable
+        |
+        v
+generic PartialEq or bytewise comparison
+```
+
+`BytewiseEq` is therefore not a universal rule applied simply because a type looks simple in memory. It is an internal optimization contract used at specific specialization points. Arrays have their own `SpecArrayEq` path, while containers such as `Vec<T>` and `String` reach bytewise comparison indirectly by forwarding equality to their contents.
 
 ## 6. How nested comparisons compose
 
-Consider a complete type:
+Consider a type with a string field and a nested vector:
 
 ```rust
 #[derive(PartialEq)]
@@ -478,7 +625,7 @@ struct Record {
 }
 ```
 
-Its outer comparison is equivalent to:
+The derived implementation compares the fields in declaration order, stopping at the first mismatch. Its behavior is equivalent to:
 
 ```rust
 impl PartialEq for Record {
@@ -488,22 +635,27 @@ impl PartialEq for Record {
 }
 ```
 
-For `name`, `String` comparison reaches its `Vec<u8>`, then slice equality, then the bytewise fast path.
+The `name` comparison delegates through `String`’s underlying `Vec<u8>` to slice equality over `u8`, which uses the bytewise specialization. If the names differ, the comparison returns `false` without comparing `rows`.
 
-For `rows`, the outer vector delegates to a slice of `Vec<i32>`. Those elements must be compared through their vector implementations. Comparing the outer vector descriptors as bytes would not compare the separately allocated row contents.
+The `rows` comparison proceeds at two levels:
 
-Each row comparison then reaches a slice of `i32`, whose elements have the bytewise marker. Thus the outer slice uses element comparisons while an inner comparison can use a bytewise fast path.
+- **Outer level:** `Vec<Vec<i32>>` delegates to slice equality over `Vec<i32>`. After checking that the number of rows matches, it compares corresponding rows by calling `Vec<i32>`’s equality implementation, stopping at the first unequal row.
+- **Inner level:** Each `Vec<i32>` delegates to slice equality over `i32`. After checking that the row lengths match, this comparison uses the bytewise specialization because `i32` implements `BytewiseEq`.
+
+The outer level cannot use the same bytewise shortcut. Its elements are `Vec<i32>` objects, which contain a pointer, length, and capacity; the integers are stored in separate allocations. Comparing those objects’ bytes would compare their storage metadata rather than their integer contents. Two rows can contain the same integers despite having different allocation addresses or capacities.
 
 ```mermaid
 flowchart TD
-    A["Record equality"] --> B["Compare name"]
-    B --> C["String delegates through Vec to byte slice"]
-    C --> D["Names equal?"]
-    D -->|No| E["false"]
-    D -->|Yes| F["Compare rows"]
-    F --> G["Outer slice compares each Vec"]
-    G --> H["Each row compares an i32 slice"]
-    H --> I["Inner bytewise fast path"]
+    A["Record::eq"] --> B["Compare name"]
+    A -->|"Only if names are equal"| C["Compare rows"]
+
+    B --> D["String → Vec<u8> → [u8]"]
+    D --> E["Check length, then compare bytes"]
+
+    C --> F["Outer slice: [Vec<i32>]"]
+    F --> G["Check row count, then compare corresponding rows"]
+    G --> H["Each row: Vec<i32> → [i32]"]
+    H --> I["Check row length, then compare bytes"]
 ```
 
-The diagram shows how implementations compose, not a promise about the final call stack. Generic code is instantiated for concrete types, and subsequent optimization can inline methods or eliminate intermediate operations. See [monomorphization in the compiler guide](https://rustc-dev-guide.rust-lang.org/backend/monomorph.html).ation selection and the compiler complete the path to executable code.
+This diagram describes how the equality implementations compose. It does not imply that every step remains a separate function call in the executable. Through [monomorphization](https://rustc-dev-guide.rust-lang.org/backend/monomorph.html), generic code is instantiated for concrete types; subsequent optimization may inline methods and remove intermediate operations.
